@@ -49,7 +49,7 @@ class BaseTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         dtype = self._resolve_dtype()
-        load_kwargs = dict(dtype=dtype)
+        load_kwargs = dict(torch_dtype=dtype)
         if self.config.attn_implementation is not None:
             load_kwargs["attn_implementation"] = self.config.attn_implementation
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -66,7 +66,7 @@ class BaseTrainer:
     def _setup_ref_model(self):
         """Load frozen reference model (full replica on each GPU, no FSDP)."""
         dtype = self._resolve_dtype()
-        load_kwargs = dict(dtype=dtype)
+        load_kwargs = dict(torch_dtype=dtype)
         if self.config.attn_implementation is not None:
             load_kwargs["attn_implementation"] = self.config.attn_implementation
         self.ref_model = AutoModelForCausalLM.from_pretrained(
