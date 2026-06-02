@@ -1,0 +1,14 @@
+model_name: Qwen/Qwen2.5-7B-Instruct
+run_name: grpo-gsm8k
+project: llm-rl
+output_dir: checkpoints/grpo-gsm8k
+lr: 1.0e-6
+batch_size: 4
+group_size: 8
+beta: 0.04
+max_length: 1024
+max_new_tokens: 512
+temperature: 0.8
+eval_steps: 50
+save_steps: 200
+num_steps: 1000
