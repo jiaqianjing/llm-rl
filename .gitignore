@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# checkpoints & outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# data cache
+data/cache/
+*.arrow
+*.parquet
+
+# jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
