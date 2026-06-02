@@ -25,7 +25,7 @@ from data.gsm8k import load_gsm8k
 from rewards.math_reward import math_reward
 
 
-def generate_pair(model, tokenizer, prompt: str, answer: str, device: str) -> dict | None:
+def generate_pair(model, tokenizer, prompt: str, answer: str, device) -> dict | None:
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
     with torch.no_grad():
         output_ids = model.generate(
@@ -55,26 +55,37 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--output", default="data/gsm8k_preference_train.json")
     parser.add_argument("--num_samples", type=int, default=2000)
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_map = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, device_map=device_map
+    )
     model.eval()
+    device = next(model.parameters()).device
 
     dataset = load_gsm8k(split="train")[:args.num_samples]
+    dataset = dataset[args.shard::args.num_shards]   # interleaved sharding
+    print(f"shard {args.shard}/{args.num_shards}: {len(dataset)} samples", flush=True)
+
     pairs = []
     for i, row in enumerate(dataset):
         pair = generate_pair(model, tokenizer, row["prompt"], row["answer"], device)
         if pair:
             pairs.append(pair)
         if (i + 1) % 100 == 0:
-            print(f"{i+1}/{len(dataset)}  collected={len(pairs)}")
+            print(f"{i+1}/{len(dataset)}  collected={len(pairs)}", flush=True)
 
-    Path(args.output).parent.mkdir(exist_ok=True)
-    with open(args.output, "w") as f:
+    out_path = Path(args.output)
+    if args.num_shards > 1:
+        out_path = out_path.with_suffix(f".shard{args.shard}.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
         json.dump(pairs, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(pairs)} pairs to {args.output}")
+    print(f"Saved {len(pairs)} pairs to {out_path}", flush=True)
 
 
 if __name__ == "__main__":
