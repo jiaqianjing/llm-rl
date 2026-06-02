@@ -1,6 +1,7 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import torch
 import wandb
@@ -22,6 +23,10 @@ class TrainerConfig:
     save_steps: int = 200
     beta: float = 0.1
     seed: int = 42
+    # None means auto-select: bfloat16 if CUDA available, else float32
+    torch_dtype: Optional[str] = None
+    # Attention implementation: "sdpa" (default), "eager", "flash_attention_2"
+    attn_implementation: Optional[str] = None
 
 
 class BaseTrainer:
@@ -32,14 +37,24 @@ class BaseTrainer:
         self._setup_ref_model()
         self._setup_wandb()
 
+    def _resolve_dtype(self) -> torch.dtype:
+        """Resolve model dtype: explicit config > auto (bfloat16 on CUDA, float32 on CPU)."""
+        if self.config.torch_dtype is not None:
+            return getattr(torch, self.config.torch_dtype)
+        return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
     def _setup_model(self):
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        dtype = self._resolve_dtype()
+        load_kwargs = dict(dtype=dtype)
+        if self.config.attn_implementation is not None:
+            load_kwargs["attn_implementation"] = self.config.attn_implementation
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch.bfloat16,
+            **load_kwargs,
         )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=self.config.lr
@@ -50,9 +65,13 @@ class BaseTrainer:
 
     def _setup_ref_model(self):
         """Load frozen reference model (full replica on each GPU, no FSDP)."""
+        dtype = self._resolve_dtype()
+        load_kwargs = dict(dtype=dtype)
+        if self.config.attn_implementation is not None:
+            load_kwargs["attn_implementation"] = self.config.attn_implementation
         self.ref_model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch.bfloat16,
+            **load_kwargs,
         )
         self.ref_model.eval()
         for p in self.ref_model.parameters():
