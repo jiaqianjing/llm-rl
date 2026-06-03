@@ -37,6 +37,8 @@ class GRPOTrainer(BaseTrainer):
         self.dataloader = self.accelerator.prepare(
             DataLoader(ds, batch_size=config.batch_size, shuffle=True)
         )
+        if hasattr(self.dataloader, 'rng_types'):
+            self.dataloader.rng_types = None
 
     def _rollout(self, prompts: list[str]) -> list[list[str]]:
         """Generate G responses per prompt using model.generate()."""
@@ -148,6 +150,7 @@ class GRPOTrainer(BaseTrainer):
 
             self.optimizer.zero_grad()
             self.accelerator.backward(loss)
+            self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             self.log({
@@ -159,9 +162,6 @@ class GRPOTrainer(BaseTrainer):
                 "kl/mean": (log_probs - ref_log_probs).mean().item(),
             }, step=global_step)
 
-            if global_step % self.config.save_steps == 0 and global_step > 0:
-                self.save_checkpoint(global_step)
-
             global_step += 1
             if global_step % 10 == 0:
                 print(
@@ -169,3 +169,6 @@ class GRPOTrainer(BaseTrainer):
                     f"loss={loss.item():.4f}  "
                     f"reward={rewards.mean().item():.3f}"
                 )
+
+            if global_step % self.config.save_steps == 0:
+                self.save_checkpoint(global_step)

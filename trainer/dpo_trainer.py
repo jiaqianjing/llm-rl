@@ -33,6 +33,8 @@ class DPOTrainer(BaseTrainer):
         self.dataloader = self.accelerator.prepare(
             DataLoader(ds, batch_size=config.batch_size, shuffle=True)
         )
+        if hasattr(self.dataloader, 'rng_types'):
+            self.dataloader.rng_types = None
 
     def _tokenize_pair(self, prompts, responses):
         """Tokenize prompt+response, return input_ids, attention_mask, response_mask."""
@@ -106,6 +108,7 @@ class DPOTrainer(BaseTrainer):
 
             self.optimizer.zero_grad()
             self.accelerator.backward(loss)
+            self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
             self.log({
@@ -115,9 +118,9 @@ class DPOTrainer(BaseTrainer):
                 "reward_margin": (chosen_rewards - rejected_rewards).mean().item(),
             }, step=global_step)
 
-            if global_step % self.config.save_steps == 0 and global_step > 0:
-                self.save_checkpoint(global_step)
-
             global_step += 1
             if global_step % 10 == 0:
                 print(f"step {global_step}/{num_steps}  loss={loss.item():.4f}")
+
+            if global_step % self.config.save_steps == 0:
+                self.save_checkpoint(global_step)

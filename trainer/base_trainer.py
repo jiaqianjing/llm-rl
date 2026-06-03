@@ -56,6 +56,7 @@ class BaseTrainer:
             self.config.model_name,
             **load_kwargs,
         )
+        self.model.gradient_checkpointing_enable()
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=self.config.lr
         )
@@ -91,10 +92,12 @@ class BaseTrainer:
             wandb.log(metrics, step=step)
 
     def save_checkpoint(self, step: int):
+        # FSDP: get_state_dict triggers all_gather — must be called on ALL ranks
+        state_dict = self.accelerator.get_state_dict(self.model)
         if self.accelerator.is_main_process:
             path = Path(self.config.output_dir) / f"step-{step}"
             path.mkdir(parents=True, exist_ok=True)
             unwrapped = self.accelerator.unwrap_model(self.model)
-            unwrapped.save_pretrained(path)
+            unwrapped.save_pretrained(path, state_dict=state_dict)
             self.tokenizer.save_pretrained(path)
             print(f"Saved checkpoint to {path}")
