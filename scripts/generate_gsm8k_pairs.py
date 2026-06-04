@@ -1,13 +1,14 @@
 """
-用 SFT 模型对 GSM8K 每个 prompt 采样 2 条 response，
-用 math_reward 打标，构建 (prompt, chosen, rejected) pairs。
+用 SFT 模型对 GSM8K 每个 prompt 采样 4 条 response（批量生成），
+用 math_reward 打标，取最好/最差构建 (prompt, chosen, rejected) pairs。
 保存为 data/gsm8k_preference_train.json。
 
 Usage:
   python scripts/generate_gsm8k_pairs.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --output data/gsm8k_preference_train.json \
-    --num_samples 2000
+    --num_samples 7473 \
+    --batch_size 8
 """
 
 import argparse
@@ -18,61 +19,83 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Add project root to path so modules can be imported when run as a script
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.gsm8k import load_gsm8k
 from rewards.math_reward import math_reward
 
 
-def generate_pair(model, tokenizer, question: str, answer: str, device,
-                  num_samples: int = 4) -> dict | None:
-    messages = [{"role": "user", "content": question}]
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
-    prompt_len = inputs["input_ids"].shape[-1]
+def build_prompt(tokenizer, question: str) -> str:
+    messages = [{"role": "user", "content": question + "\n\nSolve step by step. Write your final answer after ####."}]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # Split into batches of 2 to avoid KV-cache OOM with large num_return_sequences
-    batch_size = 2
-    responses = []
-    for _ in range(num_samples // batch_size):
+
+def generate_batch(model, tokenizer, questions: list[str], answers: list[str],
+                   device, num_samples: int = 4) -> list[dict | None]:
+    """
+    Generate num_samples responses for each question in the batch.
+    Returns a list of (prompt, chosen, rejected) dicts or None per question.
+    """
+    prompts = [build_prompt(tokenizer, q) for q in questions]
+    B = len(prompts)
+
+    # Tokenize with padding
+    enc = tokenizer(
+        prompts, return_tensors="pt", padding=True,
+        truncation=True, max_length=1024,
+    ).to(device)
+    prompt_lens = enc["attention_mask"].sum(dim=-1).tolist()
+
+    input_len = enc["input_ids"].shape[-1]  # padded input length (same for all in batch)
+
+    # Two generate calls of num_return_sequences=2 to avoid KV-cache OOM
+    all_responses = [[] for _ in range(B)]
+    for _ in range(num_samples // 2):
         with torch.no_grad():
             output_ids = model.generate(
-                **inputs,
+                **enc,
                 max_new_tokens=512,
-                num_return_sequences=batch_size,
+                num_return_sequences=2,
                 do_sample=True,
                 temperature=0.8,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        responses += [
-            tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
-            for ids in output_ids
-        ]
+        # output_ids: [B*2, input_len + generated_len]
+        # generated tokens start at input_len (left-padding means all inputs same length)
+        for b in range(B):
+            for k in range(2):
+                idx = b * 2 + k
+                resp = tokenizer.decode(
+                    output_ids[idx][input_len:], skip_special_tokens=True
+                )
+                all_responses[b].append(resp)
 
-    rewards = [math_reward(r, answer) for r in responses]
-    best_reward, worst_reward = max(rewards), min(rewards)
-    if best_reward == worst_reward:
-        return None  # all same reward → no signal
-
-    chosen   = responses[rewards.index(best_reward)]
-    rejected = responses[len(rewards) - 1 - rewards[::-1].index(worst_reward)]
-    return {"prompt": prompt, "chosen": chosen, "rejected": rejected}
+    results = []
+    for b, (prompt, answer, responses) in enumerate(zip(prompts, answers, all_responses)):
+        rewards = [math_reward(r, answer) for r in responses]
+        best_r, worst_r = max(rewards), min(rewards)
+        if best_r == worst_r:
+            results.append(None)
+            continue
+        chosen   = responses[rewards.index(best_r)]
+        rejected = responses[len(rewards) - 1 - rewards[::-1].index(worst_r)]
+        results.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--output", default="data/gsm8k_preference_train.json")
-    parser.add_argument("--num_samples", type=int, default=2000)
+    parser.add_argument("--num_samples", type=int, default=7473)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
     args = parser.parse_args()
 
     device_map = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.padding_side = "left"  # decoder-only 模型生成时用 left padding
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map=device_map
     )
@@ -80,16 +103,21 @@ def main():
     device = next(model.parameters()).device
 
     dataset = load_gsm8k(split="train")[:args.num_samples]
-    dataset = dataset[args.shard::args.num_shards]   # interleaved sharding
+    dataset = dataset[args.shard::args.num_shards]
     print(f"shard {args.shard}/{args.num_shards}: {len(dataset)} samples", flush=True)
 
     pairs = []
-    for i, row in enumerate(dataset):
-        pair = generate_pair(model, tokenizer, row["question"], row["answer"], device, num_samples=4)
-        if pair:
-            pairs.append(pair)
-        if (i + 1) % 100 == 0:
-            print(f"{i+1}/{len(dataset)}  collected={len(pairs)}", flush=True)
+    for i in range(0, len(dataset), args.batch_size):
+        batch = dataset[i: i + args.batch_size]
+        questions = [row["question"] for row in batch]
+        answers   = [row["answer"]   for row in batch]
+
+        results = generate_batch(model, tokenizer, questions, answers, device, num_samples=4)
+        pairs.extend([r for r in results if r is not None])
+
+        processed = min(i + args.batch_size, len(dataset))
+        if processed % 100 == 0 or processed == len(dataset):
+            print(f"{processed}/{len(dataset)}  collected={len(pairs)}", flush=True)
 
     out_path = Path(args.output)
     if args.num_shards > 1:

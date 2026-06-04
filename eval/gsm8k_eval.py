@@ -55,7 +55,7 @@ def evaluate(model_path: str, num_examples: int = 500) -> float:
 
     for i, row in enumerate(dataset):
         # Official-style: use chat template, no custom prompt wrapping
-        messages = [{"role": "user", "content": row["question"]}]
+        messages = [{"role": "user", "content": row["question"] + "\n\nSolve step by step. Write your final answer after ####."}]
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )

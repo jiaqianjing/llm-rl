@@ -12,22 +12,11 @@ DPO 训练需要 **(prompt, chosen, rejected)** 三元组。GSM8K 原始数据�
 
 ---
 
-## 二、Prompt 格式：必须用 Chat Template
-
-**错误做法（我们踩过的坑）：**
-```python
-# raw 格式，不是模型预训练时见过的格式
-prompt = "Solve the following math problem... write your final answer after ####.\nProblem: {q}\nSolution:"
-```
-
-这会导致 DPO 训练后模型产生灾难性遗忘（catastrophic forgetting）：
-- 模型在 raw 格式上被 DPO 优化了 1000 步
-- 评估时用 chat template，模型不认识这种输入
-- 结果：GSM8K 准确率从 81% 跌到 43%
+## 二、Prompt 格式：Chat Template + 格式指令
 
 **正确做法：**
 ```python
-messages = [{"role": "user", "content": question}]
+messages = [{"role": "user", "content": question + "\n\nSolve step by step. Write your final answer after ####."}]
 prompt = tokenizer.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
 )
@@ -38,11 +27,23 @@ prompt = tokenizer.apply_chat_template(
 <|im_start|>system
 You are a helpful assistant.<|im_end|>
 <|im_start|>user
-Janet has 3 apples...<|im_end|>
+Janet has 3 apples... Solve step by step. Write your final answer after ####.<|im_end|>
 <|im_start|>assistant
 ```
 
-**原则：训练数据的 prompt 格式必须和模型预训练/SFT 的格式一致。**
+**两个原则都要满足：**
+1. **Chat template**：必须和模型预训练/SFT 的格式一致，否则 DPO 训练会破坏模型原有能力（catastrophic forgetting）
+2. **格式指令（`####`）**：让模型输出结构化答案，reward 提取可靠，不依赖 fallback 猜测
+
+**踩过的坑：**
+
+| 做法 | 问题 |
+|------|------|
+| Raw 格式（无 chat template）| 训练后准确率 81% → 43%，catastrophic forgetting |
+| Chat template 但不加格式指令 | 模型自然输出，reward 靠 fallback 取最后数字，误判率高 |
+| ✅ Chat template + `####` 指令 | 格式一致 + 答案提取可靠 |
+
+**数据生成、DPO 训练、eval 三者必须使用完全相同的 prompt 格式。**
 
 ---
 
@@ -57,22 +58,27 @@ output_ids = model.generate(..., num_return_sequences=2, temperature=0.8)
 - 模型准确率 81%，两条都对的概率 ≈ 0.81² ≈ 66%
 - **yield 率只有 7.5%**（2000 prompt 只得到 149 对）
 
-### 改进版：每 prompt 采 4 条，取最好/最差
+### 当前版：每 prompt 采 4 条，取最好/最差，批量生成
 
 ```python
-# 分两次调用以避免 KV cache OOM
+# 批量处理多个 prompt，提升 GPU 利用率（单 prompt 时利用率 ~60%，批量后 ~90%+）
+enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024)
+tokenizer.padding_side = "left"  # 生成时必须 left padding
+
+# 分两次调用（num_return_sequences=2 × 2）避免 KV cache OOM
 for _ in range(2):
-    output_ids = model.generate(..., num_return_sequences=2, temperature=0.8)
-    responses += decode(output_ids)
+    output_ids = model.generate(**enc, num_return_sequences=2, ...)
+    # 生成 token 从 input_len 开始（left padding，所有 input 等长）
+    responses += [decode(out[input_len:]) for out in output_ids]
 
 rewards = [math_reward(r, answer) for r in responses]
 chosen   = responses[rewards.index(max(rewards))]
-rejected = responses[找最后一个 min(rewards)]
+rejected = responses[len(rewards) - 1 - rewards[::-1].index(min(rewards))]
 ```
 
-- 4 条全对的概率 ≈ 0.81⁴ ≈ 43%，有效对的概率更高
-- **yield 率提升到 13%**（2000 prompt 得到 263 对）
+- **yield 率 ~13%**（7473 prompt 目标产出 ~1000 对）
 - `num_return_sequences=4` 直接放在一个 generate 里会 OOM，需拆成 2+2
+- 批量生成时用 `left padding`，解码时 offset 用 `input_len`（padding 后的总长度），不是单条 prompt 的 token 数
 
 ---
 
@@ -138,13 +144,12 @@ DPO trainer 计算 `log p(chosen | prompt)` 和 `log p(rejected | prompt)` 时�
 
 ## 七、yield 率与数据量的权衡
 
-| 策略 | 采样数 | yield 率 | 2000 prompt 产出 |
-|------|--------|---------|----------------|
-| 2 条取好坏（raw format） | 2 | ~30% | 609 对 |
-| 2 条取好坏（chat template）| 2 | 7.5% | 149 对 |
-| 4 条取最好/最差（chat template）| 4 | 13% | 263 对 |
+| 策略 | 采样数 | yield 率 | 备注 |
+|------|--------|---------|------|
+| 4 条取最好/最差（chat template + ####）| 4 | ~13% | 当前方案，7473 prompt 目标 ~1000 对 |
 
-chat template 下 yield 更低，因为模型更强（81% vs 43%），大多数 prompt 4 条都答对。
+chat template 下 yield 低（~13%），因为 Qwen2.5-7B-Instruct 准确率 ~81%，4 条全对的概率 ≈ 0.81⁴ ≈ 43%。
+只有约 57% 的 prompt 能产出有效 pair，实际受采样方差影响约 13% 有差异对。
 
 进一步提升 yield 的方向：
 - 提高采样温度（temperature 0.8 → 1.0）增加多样性
