@@ -1,12 +1,6 @@
 import re
 from datasets import load_dataset
 
-PROMPT_TEMPLATE = (
-    "Solve the following math problem step by step. "
-    "At the end, write your final answer after ####.\n\n"
-    "Problem: {question}\nSolution:"
-)
-
 
 def extract_answer(text: str) -> str | None:
     match = re.search(r"####\s*([\d\.\-,]+)", text)
@@ -16,7 +10,7 @@ def extract_answer(text: str) -> str | None:
 
 
 def load_gsm8k(split: str = "train") -> list[dict]:
-    """Returns list of {prompt, answer} dicts."""
+    """Returns list of {question, answer} dicts."""
     raw = load_dataset("openai/gsm8k", "main", split=split)
     result = []
     for row in raw:
@@ -24,7 +18,7 @@ def load_gsm8k(split: str = "train") -> list[dict]:
         if answer is None:
             continue
         result.append({
-            "prompt": PROMPT_TEMPLATE.format(question=row["question"]),
+            "question": row["question"],
             "answer": answer,
         })
     return result

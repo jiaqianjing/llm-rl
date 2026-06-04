@@ -25,28 +25,40 @@ from data.gsm8k import load_gsm8k
 from rewards.math_reward import math_reward
 
 
-def generate_pair(model, tokenizer, prompt: str, answer: str, device) -> dict | None:
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            num_return_sequences=2,
-            do_sample=True,
-            temperature=0.8,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    responses = [
-        tokenizer.decode(ids[inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
-        for ids in output_ids
-    ]
+def generate_pair(model, tokenizer, question: str, answer: str, device,
+                  num_samples: int = 4) -> dict | None:
+    messages = [{"role": "user", "content": question}]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    prompt_len = inputs["input_ids"].shape[-1]
+
+    # Split into batches of 2 to avoid KV-cache OOM with large num_return_sequences
+    batch_size = 2
+    responses = []
+    for _ in range(num_samples // batch_size):
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                num_return_sequences=batch_size,
+                do_sample=True,
+                temperature=0.8,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        responses += [
+            tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
+            for ids in output_ids
+        ]
+
     rewards = [math_reward(r, answer) for r in responses]
-    if rewards[0] == rewards[1]:
-        return None  # same reward → discard
-    if rewards[0] > rewards[1]:
-        chosen, rejected = responses[0], responses[1]
-    else:
-        chosen, rejected = responses[1], responses[0]
+    best_reward, worst_reward = max(rewards), min(rewards)
+    if best_reward == worst_reward:
+        return None  # all same reward → no signal
+
+    chosen   = responses[rewards.index(best_reward)]
+    rejected = responses[len(rewards) - 1 - rewards[::-1].index(worst_reward)]
     return {"prompt": prompt, "chosen": chosen, "rejected": rejected}
 
 
@@ -73,7 +85,7 @@ def main():
 
     pairs = []
     for i, row in enumerate(dataset):
-        pair = generate_pair(model, tokenizer, row["prompt"], row["answer"], device)
+        pair = generate_pair(model, tokenizer, row["question"], row["answer"], device, num_samples=4)
         if pair:
             pairs.append(pair)
         if (i + 1) % 100 == 0:
