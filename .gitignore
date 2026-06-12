@@ -13,6 +13,7 @@ checkpoints/
 outputs/
 runs/
 wandb/
+eval_logs/
 
 # data cache
 data/cache/

@@ -17,8 +17,9 @@ def sequence_logprobs(
     logits = outputs.logits[:, :-1, :]              # [B, L-1, vocab]
     targets = input_ids[:, 1:]                      # [B, L-1]
     mask = response_mask[:, 1:].float()             # [B, L-1], shift to align with targets
-    log_probs = F.log_softmax(logits, dim=-1)       # [B, L-1, vocab]
-    token_logps = log_probs.gather(
-        -1, targets.unsqueeze(-1)
-    ).squeeze(-1)                                   # [B, L-1]
+    # Avoid materialising [B, L-1, vocab] log_softmax (~10 GB for batch=32, vocab=152k).
+    # gather target logit then subtract logsumexp — numerically identical, O(B*L) memory.
+    token_logits = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [B, L-1]
+    log_Z = torch.logsumexp(logits, dim=-1)                              # [B, L-1]
+    token_logps = token_logits - log_Z                                   # [B, L-1]
     return (token_logps * mask).sum(dim=-1)         # [B]

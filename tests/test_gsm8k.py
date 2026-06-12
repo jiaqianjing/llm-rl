@@ -14,7 +14,7 @@ def test_load_gsm8k_train():
     ds = load_gsm8k(split="train")
     assert len(ds) > 7000
     row = ds[0]
-    assert "prompt" in row
+    assert "question" in row
     assert "answer" in row
     assert row["answer"] is not None
 

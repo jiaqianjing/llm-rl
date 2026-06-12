@@ -16,7 +16,7 @@ def main():
     num_steps = cfg.pop("num_steps", 1000)
     config = GRPOConfig(**cfg)
 
-    dataset = load_gsm8k(split="train")
+    dataset = [{"prompt": d["question"], "answer": d["answer"]} for d in load_gsm8k(split="train")]
     trainer = GRPOTrainer(config, dataset)
     trainer.train(num_steps=num_steps)
 

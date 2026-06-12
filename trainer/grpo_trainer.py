@@ -41,8 +41,16 @@ class GRPOTrainer(BaseTrainer):
             self.dataloader.rng_types = None
 
     def _rollout(self, prompts: list[str]) -> list[list[str]]:
-        """Generate G responses per prompt using model.generate()."""
+        """Generate G responses per prompt via FSDP model forward passes with KV cache.
+
+        Uses self.model() directly so FSDP all-gathers params on the first call.
+        With SHARD_GRAD_OP, params stay gathered through all decode steps — only one
+        all-gather for the entire generation loop.
+        """
         G = self.config.group_size
+        B = len(prompts)
+        BG = B * G
+
         enc = self.tokenizer(
             prompts,
             return_tensors="pt",
@@ -51,24 +59,51 @@ class GRPOTrainer(BaseTrainer):
             max_length=512,
         ).to(self.accelerator.device)
 
-        unwrapped = self.accelerator.unwrap_model(self.model)
+        # Expand B → B*G for group sampling
+        input_ids = enc["input_ids"].repeat_interleave(G, dim=0)   # [BG, seq]
+        attn_mask = enc["attention_mask"].repeat_interleave(G, dim=0)
+        prompt_len = input_ids.shape[1]
+
+        self.model.eval()
+        generated = input_ids
+        past_kv = None
+        finished = torch.zeros(BG, dtype=torch.bool, device=input_ids.device)
+
         with torch.no_grad():
-            output_ids = unwrapped.generate(
-                **enc,
-                max_new_tokens=self.config.max_new_tokens,
-                num_return_sequences=G,
-                do_sample=True,
-                temperature=self.config.temperature,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        # output_ids: [B*G, seq_len]
-        prompt_len = enc["input_ids"].shape[-1]
+            for step in range(self.config.max_new_tokens):
+                model_in = generated if past_kv is None else generated[:, -1:]
+                out = self.model(
+                    input_ids=model_in,
+                    attention_mask=attn_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+                logits = out.logits[:, -1, :]  # [BG, vocab]
+                past_kv = out.past_key_values
+
+                next_tok = torch.multinomial(
+                    torch.softmax(logits / self.config.temperature, dim=-1), 1
+                )  # [BG, 1]
+                next_tok[finished] = self.tokenizer.eos_token_id
+                finished = finished | (next_tok.squeeze(1) == self.tokenizer.eos_token_id)
+
+                generated = torch.cat([generated, next_tok], dim=1)
+                attn_mask = torch.cat(
+                    [attn_mask, (~finished).long().unsqueeze(1)], dim=1
+                )
+                if finished.all():
+                    break
+
+        self.model.train()
+
+        # Free KV cache before decoding to reclaim GPU memory for logprob backward
+        del past_kv, attn_mask
+        torch.cuda.empty_cache()
+
         responses_flat = [
             self.tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
-            for ids in output_ids
+            for ids in generated
         ]
-        # Reshape to [B, G]
-        B = len(prompts)
         return [responses_flat[i * G:(i + 1) * G] for i in range(B)]
 
     def _compute_rewards(
